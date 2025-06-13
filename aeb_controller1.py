@@ -60,16 +60,15 @@ class AEBControllerNode(Node):
 
             for status in msg.status:
                 obj_class_id = int(status.values[0].value)  # Extract class_id
-                obj_position = Point(
-                    x=float(status.values[1].value),
-                    y=float(status.values[2].value),
-                    z=float(status.values[3].value)
-                )
-                obj_velocity = Vector3(
-                    x=float(status.values[4].value),
-                    y=float(status.values[5].value),
-                    z=float(status.values[6].value)
-                )
+                obj_position = Point()  # Correctly initialize Point object
+                obj_position.x = float(status.values[1].value)
+                obj_position.y = float(status.values[2].value)
+                obj_position.z = float(status.values[3].value)
+
+                obj_velocity = Vector3()  # Correctly initialize Vector3 object
+                obj_velocity.x = float(status.values[4].value)
+                obj_velocity.y = float(status.values[5].value)
+                obj_velocity.z = float(status.values[6].value)
 
                 # Calculate distance to object
                 distance = (obj_position.x**2 + obj_position.y**2 + obj_position.z**2)**0.5
@@ -92,6 +91,15 @@ class AEBControllerNode(Node):
             self.control_aeb()
         except Exception as e:
             self.get_logger().error(f"Error in fused_data_callback: {e}")
+            return  # Ensure we stop further execution in case of error
+
+        self.get_logger().info(
+            f"Processed Data - Class ID: {self.target_class_id}, "
+            f"Position: ({self.target_position.x:.2f}, {self.target_position.y:.2f}, {self.target_position.z:.2f}), "
+            f"Velocity: {self.relative_velocity:.2f} m/s, "
+            f"Distance: {self.current_distance:.2f} m, "
+            f"TTC: {self.current_ttc:.2f} s"
+        )
 
     def calculate_overlap(self, ego_position, target_position):
         """
@@ -107,24 +115,28 @@ class AEBControllerNode(Node):
         """
         Calculate Time-to-Collision (TTC).
         """
-        if relative_velocity > 0 and distance > 0:
-            return distance / relative_velocity
-        return float('inf')
+        if relative_velocity != 0 and distance > 0:  # Handle both positive and negative velocities
+            return distance / abs(relative_velocity)  # Use absolute value of relative velocity
+        return float('inf')  # Return infinity if velocity is zero or distance is non-positive
 
     def control_aeb(self):
         """
         Main AEB logic: Determines throttle/brake commands based on zones and scenarios.
         """
         # Zone 1: Acceleration Zone
-        if self.traveled_distance < 100:  # First 100m
+        if self.current_ttc == float('inf'):  # No obstacle detected (TTC is infinite)
             if self.relative_velocity < self.target_speed:
                 throttle_cmd = self.max_throttle
                 self.publish_control(throttle_cmd, 0.0)
                 self.get_logger().info(f"Zone 1: Accelerating. Throttle: {throttle_cmd:.2f}%")
-                return
+            return
 
         # Calculate overlap factor
-        overlap = self.calculate_overlap(Point(0.0, 0.0, 0.0), self.target_position)
+        ego_position = Point()  # Correctly initialize Point object
+        ego_position.x = 0.0
+        ego_position.y = 0.0
+        ego_position.z = 0.0
+        overlap = self.calculate_overlap(ego_position, self.target_position)
         self.get_logger().info(f"Overlap: {overlap:.2f}, Target Class ID: {self.target_class_id}")
 
         # Zone 2: Braking Zone
