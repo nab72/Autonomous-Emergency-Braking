@@ -1,0 +1,197 @@
+'''
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from radar_msgs.msg import RadarTrackList
+from inertial_msgs.msg import Pose
+from vehiclecontrol.msg import Control
+from geometry_msgs.msg import Point
+
+class AEBControllerNode(Node):
+    def __init__(self):
+        super().__init__('aeb_controller_radar_only')
+
+        # Publisher for vehicle control commands
+        self.control_pub = self.create_publisher(Control, '/vehicle_control', 10)
+
+        # Subscribers for radar and ego pose
+        self.radar_sub = self.create_subscription(
+            RadarTrackList, '/radar_processed', self.radar_callback, 10
+        )
+        self.pose_sub = self.create_subscription(
+            Pose, '/InertialData', self.pose_callback, 10
+        )
+
+        # Constants and parameters
+        self.max_throttle = 100.0  # Max throttle percentage
+        self.max_brake = 100.0     # Max brake percentage
+        self.target_speed = 8.33333   # Target speed in m/s
+        self.target_stop_distance = 6.0
+        self.stop_tolerance = 2.0  # ±2m tolerance
+        self.safe_ttc_threshold = 8.0  # practical upper TTC for safe acceleration
+        self.emergency_ttc = 1.0       # Threshold TTC for emergency braking (seconds)
+        self.warning_ttc = 3.0         # Threshold TTC for warning braking (seconds)
+        self.vehicle_width = 1.5       # Width of the BAJA Car in meters
+        self.target_width = 1.8        # Default width of target object (can be adjusted)
+
+        # State variables
+        self.ego_velocity = 0.0
+        self.current_distance = float('inf')
+        self.relative_velocity = 0.0
+        self.current_ttc = float('inf')
+        self.target_position = None
+
+        # Radar buffer (store last received radar message)
+        self.last_radar_msg = None
+
+    def pose_callback(self, msg):
+        self.ego_velocity = msg.velocity.x
+        if self.last_radar_msg is not None:
+            self.process_aeb_with_radar(self.last_radar_msg)
+
+    def radar_callback(self, msg):
+        self.last_radar_msg = msg
+        self.process_aeb_with_radar(msg)
+
+    def process_aeb_with_radar(self, radar_msg):
+        """
+        Main logic: Find nearest radar object, compute TTC, and perform AEB logic.
+        """
+        try:
+            nearest_distance = float('inf')
+            nearest_obj = None
+
+            for obj in radar_msg.objects:
+                # Calculate distance to object in X/Y plane
+                distance = (obj.x_distance ** 2 + obj.y_distance ** 2) ** 0.5
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest_obj = obj
+
+            if nearest_obj is None:
+                # No objects detected: safe to accelerate
+                self.current_distance = float('inf')
+                self.relative_velocity = 0.0
+                self.current_ttc = float('inf')
+                self.target_position = None
+                self.control_aeb()
+                return
+
+            # Radar gives velocity relative to ego vehicle (usually)
+            rel_velocity = nearest_obj.vx  # vx is relative velocity in X direction
+            self.current_distance = nearest_distance
+            self.relative_velocity = rel_velocity
+
+            # Calculate TTC (only if object is approaching)
+            if rel_velocity < 0:
+                ttc = nearest_distance / abs(rel_velocity)
+            else:
+                ttc = float('inf')
+            self.current_ttc = ttc
+
+            # Create a pseudo-position for overlap logic
+            self.target_position = Point()
+            self.target_position.x = nearest_obj.x_distance
+            self.target_position.y = nearest_obj.y_distance
+            self.target_position.z = 0.0
+
+            self.control_aeb()
+
+            self.get_logger().info(
+                f"Radar Processed - Position: ({self.target_position.x:.2f}, {self.target_position.y:.2f}, {self.target_position.z:.2f}), "
+                f"Rel Velocity: {self.relative_velocity:.2f} m/s, "
+                f"Distance: {self.current_distance:.2f} m, TTC: {self.current_ttc:.2f} s"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Error in process_aeb_with_radar: {e}")
+
+    def calculate_overlap(self, ego_position, target_position):
+        """
+        Calculate lateral overlap between ego vehicle and target object.
+        """
+        lateral_distance = abs(ego_position.y - target_position.y)
+        overlap = max(0, (self.vehicle_width + self.target_width - lateral_distance) / (self.vehicle_width + self.target_width))
+        return min(overlap, 1.0)  # Constrain overlap to [0, 1]
+
+    def control_aeb(self):
+        """
+        Main AEB logic: Determines throttle/brake commands based on zones and scenarios.
+        """
+        control_msg = Control()
+        control_msg.steering = 0.0  # Default steering angle
+        control_msg.latswitch = 0   # Default lateral switch state
+        control_msg.longswitch = 1  # Enable longitudinal control switch
+
+        # Zone 1: Acceleration Zone
+        if self.current_ttc > self.safe_ttc_threshold:
+            if self.ego_velocity < self.target_speed:
+                control_msg.throttle = self.max_throttle
+                control_msg.brake = 0.0
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Safe TTC ({self.current_ttc:.2f}s > {self.safe_ttc_threshold}s): Accelerating. Throttle: {control_msg.throttle:.2f}%")
+            return
+
+        # Calculate overlap factor
+        ego_position = self.target_position if self.target_position is not None else self.make_zero_point()
+        overlap = self.calculate_overlap(ego_position, self.target_position if self.target_position else self.make_zero_point())
+        self.get_logger().info(f"Overlap: {overlap:.2f}")
+
+        # Zone 2: Braking Zone
+        if self.current_ttc < self.warning_ttc:
+            if self.current_ttc < self.emergency_ttc:
+                # Emergency braking
+                control_msg.throttle = 0.0
+                control_msg.brake = self.max_brake
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Zone 2: Emergency Brake! Brake: {control_msg.brake:.2f}%, TTC: {self.current_ttc:.2f}")
+            else:
+                # Gradual braking
+                control_msg.throttle = 0.0
+                control_msg.brake = self.calculate_brake_force(self.current_ttc, overlap)
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Zone 2: Gradual Brake. Brake: {control_msg.brake:.2f}%, TTC: {self.current_ttc:.2f}")
+            return
+
+        # Zone 3: Stopping Zone
+        if (self.target_stop_distance - self.stop_tolerance <= self.current_distance <= self.target_stop_distance + self.stop_tolerance):
+            control_msg.throttle = 0.0
+            control_msg.brake = self.max_brake
+            self.publish_control(control_msg)
+            self.get_logger().info("Zone 3: Stopping achieved within target zone.")
+            return
+
+    def calculate_brake_force(self, ttc, overlap):
+        """
+        Calculate appropriate brake force based on TTC and overlap factor.
+        """
+        brake_factor = overlap  # Reduce brake force based on overlap
+        # Linear scaling of brake force based on TTC
+        return self.max_brake * brake_factor * (1.0 - (ttc / self.warning_ttc))
+
+    def publish_control(self, control_msg):
+        self.get_logger().info(
+            f"Publishing Control Command - Steering: {control_msg.steering}, "
+            f"Throttle: {control_msg.throttle}, Brake: {control_msg.brake}, "
+            f"LongSwitch: {control_msg.longswitch}, LatSwitch: {control_msg.latswitch}"
+        )
+        self.control_pub.publish(control_msg)
+
+    @staticmethod
+    def make_zero_point():
+        pt = Point()
+        pt.x = 0.0
+        pt.y = 0.0
+        pt.z = 0.0
+        return pt
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AEBControllerNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+'''
